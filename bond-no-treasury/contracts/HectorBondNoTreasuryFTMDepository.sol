@@ -584,27 +584,11 @@ library FixedPoint {
     }
 }
 
-interface ITreasury {
-    function deposit( uint _amount, address _token, uint _profit ) external returns ( bool );
-    function valueOf( address _token, uint _amount ) external view returns ( uint value_ );
+interface IUniswapPairOracle {
+    function consult(address token, uint256 amountIn) external view returns (uint256 amountOut);
 }
 
-interface IBondCalculator {
-    function valuation( address _LP, uint _amount ) external view returns ( uint );
-    function markdown( address _LP ) external view returns ( uint );
-}
-
-interface IStaking {
-    function stake( uint _amount, address _recipient ) external returns ( bool );
-}
-
-interface IStakingHelper {
-    function stake( uint _amount, address _recipient ) external;
-}
-interface IBackingCalculator {
-    function treasuryBacking() external view returns(uint _treasuryBacking);
-}
-contract HectorBondDepositoryV2 is Ownable {
+contract HectorBondNoTreasuryFTMDepository is Ownable {
 
     using FixedPoint for *;
     using SafeERC20 for IERC20;
@@ -627,30 +611,24 @@ contract HectorBondDepositoryV2 is Ownable {
 
     address public immutable HEC; // token given as payment for bond
     address public immutable principle; // token used to create bond
-    address public immutable treasury; // mints HEC when receives principle
     address public immutable DAO; // receives profit share from bond
 
-    bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
-    address public immutable bondCalculator; // calculates value of LP tokens
-
-    address public staking; // to auto-stake payout
-    address public stakingHelper; // to stake and claim if no staking warmup
-    bool public useHelper;
+    address public immutable oracle; // uniswap twap oracle
 
     Terms public terms; // stores terms for new bonds
     Adjust public adjustment; // stores adjustment to BCV data
 
     mapping( address => Bond ) public bondInfo; // stores bond information for depositors
 
+    mapping( uint => uint) public lockingDiscounts; // stores discount in hundreths for locking periods ( 500 = 5% = 0.05 )
+
     uint public totalDebt; // total value of outstanding bonds; used for pricing
     uint public lastDecay; // reference block for debt decay
 
+    uint public totalRemainingPayout; // total remaining HEC payout for bonding
     uint public totalPrinciple; // total principle bonded through this depository
     
     string internal name_; //name of this bond
-    IBackingCalculator public backingCalculator;
-    uint8 public principleDecimals; //principle decimals or pair markdown decimals
-    uint8 public premium;//percent , 20%=20
 
     /* ======== STRUCTS ======== */
 
@@ -662,13 +640,14 @@ contract HectorBondDepositoryV2 is Ownable {
         uint maxPayout; // in thousandths of a %. i.e. 500 = 0.5%
         uint fee; // as % of bond payout, in hundreths. ( 500 = 5% = 0.05 for every 1 paid)
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
+        uint totalSupply; // HEC total supply
     }
 
     // Info for bond holder
     struct Bond {
         uint payout; // HEC remaining to be paid
         uint vesting; // Blocks left to vest
-        uint lastBlock; // Last interaction
+        uint lastBlockAt; // Last interaction
         uint pricePaid; // In DAI, for front end viewing
     }
 
@@ -690,29 +669,19 @@ contract HectorBondDepositoryV2 is Ownable {
         string memory _name,
         address _HEC,
         address _principle,
-        uint8 _principleDecimals,
-        address _treasury, 
         address _DAO, 
-        address _backingCalculator,
-        address _bondCalculator
+        address _oracle
     ) {
         require( _HEC != address(0) );
         HEC = _HEC;
         require( _principle != address(0) );
         principle = _principle;
-        require(_principleDecimals!=0);
-        principleDecimals =_principleDecimals;
-        require( _treasury != address(0) );
-        treasury = _treasury;
         require( _DAO != address(0) );
         DAO = _DAO;
-        require(address(0)!=_backingCalculator);
-        backingCalculator=IBackingCalculator(_backingCalculator);
-        // bondCalculator should be address(0) if not LP bond
-        bondCalculator = _bondCalculator;
-        isLiquidityBond = ( _bondCalculator != address(0) );
+        require( _oracle != address(0) );
+        oracle = _oracle;
+        
         name_ = _name;
-        premium=20;
     }
 
     /**
@@ -724,6 +693,7 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @param _fee uint
      *  @param _maxDebt uint
      *  @param _initialDebt uint
+     *  @param _totalSupply uint
      */
     function initializeBondTerms( 
         uint _controlVariable, 
@@ -732,6 +702,7 @@ contract HectorBondDepositoryV2 is Ownable {
         uint _maxPayout,
         uint _fee,
         uint _maxDebt,
+        uint _totalSupply,
         uint _initialDebt
     ) external onlyPolicy() {
         terms = Terms ({
@@ -740,7 +711,8 @@ contract HectorBondDepositoryV2 is Ownable {
             minimumPrice: _minimumPrice,
             maxPayout: _maxPayout,
             fee: _fee,
-            maxDebt: _maxDebt
+            maxDebt: _maxDebt,
+            totalSupply: _totalSupply
         });
         totalDebt = _initialDebt;
         lastDecay = block.number;
@@ -751,7 +723,7 @@ contract HectorBondDepositoryV2 is Ownable {
     
     /* ======== POLICY FUNCTIONS ======== */
 
-    enum PARAMETER { VESTING, PAYOUT, FEE, DEBT, MINPRICE }
+    enum PARAMETER { VESTING, PAYOUT, FEE, DEBT, MINPRICE, TOTALSUPPLY }
     /**
      *  @notice set parameters for new bonds
      *  @param _parameter PARAMETER
@@ -771,7 +743,21 @@ contract HectorBondDepositoryV2 is Ownable {
             terms.maxDebt = _input;
         } else if ( _parameter == PARAMETER.MINPRICE ) { // 4
             terms.minimumPrice = _input;
+        }  else if ( _parameter == PARAMETER.TOTALSUPPLY ) { // 5
+            terms.totalSupply = _input;
         }
+    }
+
+    /**
+     *  @notice set discount for locking period
+     *  @param _lockingPeriod uint
+     *  @param _discount uint
+     */
+    function setLockingDiscount( uint _lockingPeriod, uint _discount ) external onlyPolicy() {
+        require( _lockingPeriod > 0, "Invalid locking period" );
+        require( _discount > 0 && _discount < 10000, "Invalid discount" );
+
+        lockingDiscounts[ _lockingPeriod ] = _discount;
     }
 
     /**
@@ -796,23 +782,6 @@ contract HectorBondDepositoryV2 is Ownable {
         });
     }
 
-    /**
-     *  @notice set contract for auto stake
-     *  @param _staking address
-     *  @param _helper bool
-     */
-    function setStaking( address _staking, bool _helper ) external onlyPolicy() {
-        require( _staking != address(0) );
-        if ( _helper ) {
-            useHelper = true;
-            stakingHelper = _staking;
-        } else {
-            useHelper = false;
-            staking = _staking;
-        }
-    }
-
-
     
 
     /* ======== USER FUNCTIONS ======== */
@@ -821,48 +790,45 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @notice deposit bond
      *  @param _amount uint
      *  @param _maxPrice uint
+     *  @param _lockingPeriod uint
      *  @param _depositor address
      *  @return uint
      */
     function deposit( 
         uint _amount, 
         uint _maxPrice,
+        uint _lockingPeriod,
         address _depositor
     ) external returns ( uint ) {
         require( _depositor != address(0), "Invalid address" );
 
+        uint discount = lockingDiscounts[ _lockingPeriod ];
+        require( discount > 0, "Invalid locking period");
+
         decayDebt();
         require( totalDebt <= terms.maxDebt, "Max capacity reached" );
         
-        uint priceInUSD = bondPriceInUSD(); // Stored in bond info
-        uint nativePrice = _bondPrice();
+        uint priceInUSD = bondPriceInUSD().mul( 10000 - discount ).div( 10000 ); // Stored in bond info
+        uint nativePrice = _bondPrice().mul( 10000 - discount ).div( 10000 );
 
         require( _maxPrice >= nativePrice, "Slippage limit: more than max price" ); // slippage protection
 
-        uint value = ITreasury( treasury ).valueOf( principle, _amount );
-        uint payout = payoutFor( value ); // payout to bonder is computed
+        uint value = _amount.mul( 10 ** IERC20( HEC ).decimals() ).div( 10 ** IERC20( principle ).decimals() );
+        uint payout = payoutFor( value, discount ); // payout to bonder is computed
 
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 HEC ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
-        // profits are calculated
-        uint fee = payout.mul( terms.fee ).div( 10000 );
-        uint profit = value.sub( payout ).sub( fee );
+        // total remaining payout is increased
+        totalRemainingPayout = totalRemainingPayout.add( payout );
+        require( totalRemainingPayout <= IERC20( HEC ).balanceOf(address(this)), "Insufficient HEC"); // has enough HEC balance for payout
 
         /**
-            principle is transferred in
-            approved and
-            deposited into the treasury, returning (_amount - profit) HEC
+            principle is transferred
          */
         IERC20( principle ).safeTransferFrom( msg.sender, address(this), _amount );
-        IERC20( principle ).approve( address( treasury ), _amount );
-        ITreasury( treasury ).deposit( _amount, principle, profit );
         
         totalPrinciple=totalPrinciple.add(_amount);
-        
-        if ( fee != 0 ) { // fee is transferred to dao 
-            IERC20( HEC ).safeTransfer( DAO, fee ); 
-        }
         
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
@@ -870,13 +836,13 @@ contract HectorBondDepositoryV2 is Ownable {
         // depositor info is stored
         bondInfo[ _depositor ] = Bond({ 
             payout: bondInfo[ _depositor ].payout.add( payout ),
-            vesting: terms.vestingTerm,
-            lastBlock: block.number,
+            vesting: _lockingPeriod,
+            lastBlockAt: block.timestamp,
             pricePaid: priceInUSD
         });
 
         // indexed events are emitted
-        emit BondCreated( _amount, payout, block.number.add( terms.vestingTerm ), priceInUSD );
+        emit BondCreated( _amount, payout, block.timestamp.add( _lockingPeriod ), priceInUSD );
         emit BondPriceChanged( bondPriceInUSD(), _bondPrice(), debtRatio() );
 
         adjust(); // control variable is adjusted
@@ -886,60 +852,29 @@ contract HectorBondDepositoryV2 is Ownable {
     /** 
      *  @notice redeem bond for user
      *  @param _recipient address
-     *  @param _stake bool
      *  @return uint
      */ 
-    function redeem( address _recipient, bool _stake ) external returns ( uint ) {        
+    function redeem( address _recipient ) external returns ( uint ) {        
         Bond memory info = bondInfo[ _recipient ];
         uint percentVested = percentVestedFor( _recipient ); // (blocks since last interaction / vesting term remaining)
 
-        if ( percentVested >= 10000 ) { // if fully vested
-            delete bondInfo[ _recipient ]; // delete user info
-            emit BondRedeemed( _recipient, info.payout, 0 ); // emit bond data
-            return stakeOrSend( _recipient, _stake, info.payout ); // pay user everything due
+        require(percentVested >= 10000, "Not fully vested");
 
-        } else { // if unfinished
-            // calculate payout vested
-            uint payout = info.payout.mul( percentVested ).div( 10000 );
+        delete bondInfo[ _recipient ]; // delete user info
 
-            // store updated deposit info
-            bondInfo[ _recipient ] = Bond({
-                payout: info.payout.sub( payout ),
-                vesting: info.vesting.sub( block.number.sub( info.lastBlock ) ),
-                lastBlock: block.number,
-                pricePaid: info.pricePaid
-            });
+        totalRemainingPayout = totalRemainingPayout.sub( info.payout );  // total remaining payout is decreased
+        
+        IERC20( HEC ).transfer( _recipient, info.payout ); // send payout
 
-            emit BondRedeemed( _recipient, payout, bondInfo[ _recipient ].payout );
-            return stakeOrSend( _recipient, _stake, payout );
-        }
+        emit BondRedeemed( _recipient, info.payout, 0 ); // emit bond data
+
+        return info.payout;
     }
 
 
 
     
     /* ======== INTERNAL HELPER FUNCTIONS ======== */
-
-    /**
-     *  @notice allow user to stake payout automatically
-     *  @param _stake bool
-     *  @param _amount uint
-     *  @return uint
-     */
-    function stakeOrSend( address _recipient, bool _stake, uint _amount ) internal returns ( uint ) {
-        if ( !_stake ) { // if user does not want to stake
-            IERC20( HEC ).transfer( _recipient, _amount ); // send payout
-        } else { // if user wants to stake
-            if ( useHelper ) { // use if staking warmup is 0
-                IERC20( HEC ).approve( stakingHelper, _amount );
-                IStakingHelper( stakingHelper ).stake( _amount, _recipient );
-            } else {
-                IERC20( HEC ).approve( staking, _amount );
-                IStaking( staking ).stake( _amount, _recipient );
-            }
-        }
-        return _amount;
-    }
 
     /**
      *  @notice makes incremental adjustment to control variable
@@ -972,16 +907,6 @@ contract HectorBondDepositoryV2 is Ownable {
         lastDecay = block.number;
     }
 
-    function setBackingCalculator(address _backingCalculator) external onlyPolicy{
-        require(address(0)!=_backingCalculator);
-        backingCalculator=IBackingCalculator(_backingCalculator);
-    }
-
-    function setPrincipleDecimals(uint8 _principleDecimals) external onlyPolicy{
-        require(_principleDecimals!=0);
-        principleDecimals=_principleDecimals;
-    }
-
 
     /* ======== VIEW FUNCTIONS ======== */
 
@@ -990,68 +915,44 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @return uint
      */
     function maxPayout() public view returns ( uint ) {
-        return IERC20( HEC ).totalSupply().mul( terms.maxPayout ).div( 100000 );
+        return terms.totalSupply.mul( terms.maxPayout ).div( 100000 );
     }
 
     /**
      *  @notice calculate interest due for new bond
      *  @param _value uint
+     *  @param _discount uint
      *  @return uint
      */
-    function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18().div( 1e14 );
+    function payoutFor( uint _value, uint _discount ) public view returns ( uint ) {
+        uint nativePrice = bondPrice().mul( 10000 - _discount ).div( 10000 );
+
+        return FixedPoint.fraction( _value, nativePrice ).decode112with18().div( 1e14 );
     }
 
 
     /**
-     *  @notice calculate current bond premium
+     *  @notice calculate current bond price
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {
-        if(isLiquidityBond)
-            price_ = terms.controlVariable.mul( debtRatio() ).div( 1e5 );
-        else
-            price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e5 );
+        price_ = IUniswapPairOracle( oracle ).consult( HEC, 1e9 ).div( 1e14 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;
         }
-        uint bph=backingCalculator.treasuryBacking();//1e4
-        uint nativeBph=toNativePrice(bph);//1e4
-        uint priceFloor=nativeBph.mul(uint(100).add(premium)).div(100);
-        if ( price_ < priceFloor ) {
-            price_ = priceFloor;
-        }
     }
-    function toNativePrice(uint _bph) public view returns (uint _nativeBph){
-        if(isLiquidityBond)
-            _nativeBph=_bph.mul(10**principleDecimals).div(IBondCalculator( bondCalculator ).markdown( principle ));
-        else
-            _nativeBph=_bph;
-    }
+    
     /**
      *  @notice calculate current bond price and remove floor if above
      *  @return price_ uint
      */
     function _bondPrice() internal returns ( uint price_ ) {
-        if(isLiquidityBond)
-            price_ = terms.controlVariable.mul( debtRatio() ).div( 1e5 );
-        else
-            price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ).div( 1e5 );
+        price_ = IUniswapPairOracle( oracle ).consult( HEC, 1e9 ).div( 1e14 );
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;        
         } else if ( terms.minimumPrice != 0 ) {
             terms.minimumPrice = 0;
         }
-        uint bph=backingCalculator.treasuryBacking();//1e4
-        uint nativeBph=toNativePrice(bph);//1e4
-        uint priceFloor=nativeBph.mul(uint(100).add(premium)).div(100);
-        if ( price_ < priceFloor ) {
-            price_ = priceFloor;
-        }
-    }
-
-    function setPremium(uint8 _premium) external onlyPolicy{
-        premium=_premium;
     }
 
     /**
@@ -1059,11 +960,7 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @return price_ uint
      */
     function bondPriceInUSD() public view returns ( uint price_ ) {
-        if( isLiquidityBond ) {
-            price_ = bondPrice().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 1e4 );
-        } else {
-            price_ = bondPrice().mul( 10 ** IERC20( principle ).decimals() ).div( 1e4 );
-        }
+        price_ = bondPrice().mul( 10 ** IERC20( principle ).decimals() ).div( 1e4 );
     }
 
 
@@ -1072,7 +969,7 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @return debtRatio_ uint
      */
     function debtRatio() public view returns ( uint debtRatio_ ) {   
-        uint supply = IERC20( HEC ).totalSupply();
+        uint supply = terms.totalSupply;
         debtRatio_ = FixedPoint.fraction( 
             currentDebt().mul( 1e9 ), 
             supply
@@ -1084,11 +981,7 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @return uint
      */
     function standardizedDebtRatio() external view returns ( uint ) {
-        if ( isLiquidityBond ) {
-            return debtRatio().mul( IBondCalculator( bondCalculator ).markdown( principle ) ).div( 1e9 );
-        } else {
-            return debtRatio();
-        }
+        return debtRatio();
     }
 
     /**
@@ -1119,11 +1012,11 @@ contract HectorBondDepositoryV2 is Ownable {
      */
     function percentVestedFor( address _depositor ) public view returns ( uint percentVested_ ) {
         Bond memory bond = bondInfo[ _depositor ];
-        uint blocksSinceLast = block.number.sub( bond.lastBlock );
+        uint timestampSinceLast = block.timestamp.sub( bond.lastBlockAt );
         uint vesting = bond.vesting;
 
         if ( vesting > 0 ) {
-            percentVested_ = blocksSinceLast.mul( 10000 ).div( vesting );
+            percentVested_ = timestampSinceLast.mul( 10000 ).div( vesting );
         } else {
             percentVested_ = 0;
         }
@@ -1161,10 +1054,12 @@ contract HectorBondDepositoryV2 is Ownable {
      *  @notice allow anyone to send lost tokens (excluding principle or HEC) to the DAO
      *  @return bool
      */
-    function recoverLostToken( address _token ) external returns ( bool ) {
-        require( _token != HEC );
-        require( _token != principle );
-        IERC20( _token ).safeTransfer( DAO, IERC20( _token ).balanceOf( address(this) ) );
-        return true;
+    function withdrawToken( address _token ) external onlyPolicy returns ( bool ) { 
+        uint amount = IERC20( _token ).balanceOf( address(this) ); 
+        if( _token == HEC ){ 
+            amount = amount.sub(totalRemainingPayout); 
+        } 
+        IERC20( _token ).safeTransfer( DAO, amount ); 
+        return true; 
     }
 }
